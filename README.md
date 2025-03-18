@@ -30,10 +30,30 @@ Install dependencies (we test on python=3.7.9, pytorch==1.8.0, cuda==11.1, gcc==
 ```
 git clone https://github.com/dvlab-research/SphereFormer.git --recursive
 pip install torch==1.8.0+cu111 torchvision==0.9.0+cu111 torchaudio==0.8.0 -f https://download.pytorch.org/whl/torch_stable.html
+```
+torch_scatter有时候能直接安装，有时候不能
+```
 pip install torch_scatter==2.0.9
+```
+正常安装
+```
 pip install torch_geometric==1.7.2
+```
+spconv-cu114只有2.1.25的，也能用
+```
 pip install spconv-cu114==2.1.21
+```
+安装spconv时，会带上一个0.2.9的cumm，要用pip进行uninstall。
+之后分别安装whl即可，（无法使用pip的话）
+```
+https://pypi.tuna.tsinghua.edu.cn/simple/cumm-cu114/
+https://pytorch-geometric.com/whl/torch-1.8.0%2Bcu111.html
+```
+```
 pip install torch_sparse==0.6.12 cumm-cu114==0.2.8 torch_cluster==1.5.9
+```
+正常安装即可
+```
 pip install tensorboard timm termcolor tensorboardX
 ```
 
