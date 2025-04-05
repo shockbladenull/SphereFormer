@@ -37,7 +37,7 @@ def collation_fn_voxelmean(batch):
     :return:   coords_batch: N x 4 (x,y,z,batch)
 
     """
-    coords, xyz, feats, labels, inds_recons = list(zip(*batch))
+    coords, xyz, feats, labels, inds_recons, file_names = list(zip(*batch))
     inds_recons = list(inds_recons)
 
     accmulate_points_num = 0
@@ -53,8 +53,9 @@ def collation_fn_voxelmean(batch):
     labels = torch.cat(labels)
     offset = torch.IntTensor(offset)
     inds_recons = torch.cat(inds_recons)
+    file_names = list(file_names)  # 保持为列表，无需拼接
 
-    return coords, xyz, feats, labels, offset, inds_recons
+    return coords, xyz, feats, labels, offset, inds_recons, file_names  # 返回 7 个值
 
 def collation_fn_voxelmean_tta(batch_list):
     """

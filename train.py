@@ -36,9 +36,11 @@ import yaml
 from torch_scatter import scatter_mean
 import spconv.pytorch as spconv
 
+import traceback
+
 def get_parser():
     parser = argparse.ArgumentParser(description='PyTorch Point Cloud Semantic Segmentation')
-    parser.add_argument('--config', type=str, default='config/s3dis/s3dis_stratified_transformer.yaml', help='config file')
+    parser.add_argument('--config', type=str, default='config/semantic_kitti/semantic_kitti_unet32_spherical_transformer.yaml', help='config file')
     parser.add_argument('opts', help='see config/s3dis/s3dis_stratified_transformer.yaml for all options', default=None, nargs=argparse.REMAINDER)
     args = parser.parse_args()
     assert args.config is not None
@@ -397,8 +399,10 @@ def main_worker(gpu, ngpus_per_node, argss):
             validate_tta(val_loader, model, criterion)
         else:
             # validate(val_loader, model, criterion)
-            validate_distance(val_loader, model, criterion)
-        exit()
+            # validate_distance(val_loader, model, criterion)
+            # validate_and_print_points9(val_loader, model)
+            remove_moving_points_from_pointcloud(val_loader, model, save_folder='output')
+            return
 
     for epoch in range(args.start_epoch, args.epochs):
         if args.distributed:
@@ -895,6 +899,639 @@ def validate_distance(val_loader, model, criterion):
     
     return loss_meter.avg, mIoU, mAcc, allAcc
 
+def validate_and_print_points7(val_loader, model):
+    if main_process():
+        logger.info('>>>>>>>>>>>>>>>> Start Evaluation and Saving Predictions >>>>>>>>>>>>>>>>')
+    
+    batch_time = AverageMeter()
+    data_time = AverageMeter()
+    
+    # 点云统计计数器
+    total_points_count = 0
+    moving_points_in_gt_count = 0
+    moving_points_in_pred_count = 0
+    prediction_differs_count = 0
+    
+    # 添加预测类别统计字典
+    prediction_class_counts = {}
+    gt_class_counts = {}
+    
+    model.eval()
+    end = time.time()
+    
+    # 获取进程信息
+    rank = 0
+    if args.multiprocessing_distributed:
+        rank = dist.get_rank()
+    
+    with torch.no_grad():
+        for i, batch_data in enumerate(val_loader):
+            data_time.update(time.time() - end)
+            
+            if main_process() and (i + 1) % args.print_freq == 0:
+                logger.info(f'Processing batch {i+1}/{len(val_loader)}')
+            
+            # 解包批次数据
+            (coord, xyz, feat, target, offset, inds_reverse, file_names) = batch_data
+            
+            # 计算当前批次中的点数
+            batch_points_count = coord.shape[0]
+            total_points_count += batch_points_count
+            
+            # 计算原始标签中移动物体的点数 - 修改为类别ID为19的点
+            moving_mask_gt = (target == 19)
+            moving_points_gt = moving_mask_gt.sum().item()
+            moving_points_in_gt_count += moving_points_gt
+            
+            inds_reverse = inds_reverse.cuda(non_blocking=True)
+            
+            offset_ = offset.clone()
+            offset_[1:] = offset_[1:] - offset_[:-1]
+            
+            # 计算每个样本中的点数量
+            points_per_sample = offset_.tolist()
+            if main_process() and (i + 1) % args.print_freq == 0:
+                logger.info(f'Points per sample: {points_per_sample}')
+            
+            batch = torch.cat([torch.tensor([ii]*o) for ii,o in enumerate(offset_)], 0).long()
+            
+            coord = torch.cat([batch.unsqueeze(-1), coord], -1)
+            spatial_shape = np.clip((coord.max(0)[0][1:] + 1).numpy(), 128, None)
+                       
+            coord, xyz, feat, target = coord.cuda(non_blocking=True), xyz.cuda(non_blocking=True), feat.cuda(non_blocking=True), target.cuda(non_blocking=True)
+            offset = offset.cuda(non_blocking=True)
+            batch = batch.cuda(non_blocking=True)
+            
+            sinput = spconv.SparseConvTensor(feat, coord.int(), spatial_shape, args.batch_size_val)
+            
+            # 运行模型并获取预测结果
+            output = model(sinput, xyz, batch)
+            output = output[inds_reverse, :]
+            
+            # 获取预测类别
+            pred_logits = output.max(1)[1]
+            
+            # 计算预测结果中移动物体的点数 - 修改为类别ID为19的点
+            moving_mask_pred = (pred_logits == 19)
+            moving_points_pred = moving_mask_pred.sum().item()
+            moving_points_in_pred_count += moving_points_pred
+            
+            # 计算预测与标签不同的点数
+            differs_mask = (pred_logits != target)
+            batch_prediction_differs = differs_mask.sum().item()
+            prediction_differs_count += batch_prediction_differs
+            
+            # 将预测结果和目标标签转移到CPU进行保存
+            predictions = pred_logits.cpu().numpy()
+            target_cpu = target.cpu().numpy()
+            batch_idx = batch[inds_reverse].cpu().numpy()
+            
+            # 统计预测类别分布
+            unique_pred_classes, pred_counts = np.unique(predictions, return_counts=True)
+            for cls, count in zip(unique_pred_classes, pred_counts):
+                if cls in prediction_class_counts:
+                    prediction_class_counts[cls] += count
+                else:
+                    prediction_class_counts[cls] = count
+            
+            # 统计真实标签类别分布
+            unique_gt_classes, gt_counts = np.unique(target_cpu, return_counts=True)
+            for cls, count in zip(unique_gt_classes, gt_counts):
+                if cls in gt_class_counts:
+                    gt_class_counts[cls] += count
+                else:
+                    gt_class_counts[cls] = count
+            
+            # 保存预测结果，按照SemanticKITTI格式
+            for b_idx in np.unique(batch_idx):
+                mask = batch_idx == b_idx
+                scan_predictions = predictions[mask]
+                scan_targets = target_cpu[mask]
+                
+                # 使用原始标签中的移动物体掩码过滤预测结果 - 修改为类别ID为19的点
+                moving_mask_gt_sample = (scan_targets == 19)
+                non_moving_mask = ~moving_mask_gt_sample
+                filtered_predictions = scan_predictions[non_moving_mask]
+                
+                # 使用文件名构建保存路径
+                current_file = file_names[int(b_idx)]
+                sequence_dir = os.path.dirname(os.path.dirname(current_file))
+                sequence_id = os.path.basename(sequence_dir)
+                frame_id = os.path.basename(current_file).split('.')[0]
+                
+                # 创建保存目录
+                # save_dir = os.path.join(args.save_folder, 'predictions', sequence_id)
+                # os.makedirs(save_dir, exist_ok=True)
+                
+                # 保存过滤后的预测结果
+                # save_path = os.path.join(save_dir, f'{frame_id}.label')
+                # filtered_predictions = filtered_predictions.astype(np.uint32)
+                # filtered_predictions.tofile(save_path)
+                
+                if main_process() and (i + 1) % args.print_freq == 0:
+                    points_in_frame = np.sum(mask)
+                    moving_points_gt_sample = np.sum(moving_mask_gt_sample)
+                    moving_points_pred_sample = np.sum((scan_predictions == 19))
+                    
+                    # 计算该样本中预测与标签不同的点数
+                    differs_in_sample = np.sum(scan_predictions != scan_targets)
+                    
+                    logger.info(f'Saved prediction for sequence {sequence_id}, frame {frame_id}')
+                    logger.info(f'  - Total points in frame: {points_in_frame}')
+                    logger.info(f'  - Moving points in GT: {moving_points_gt_sample} ({moving_points_gt_sample/points_in_frame*100:.2f}%)')
+                    logger.info(f'  - Moving points in prediction: {moving_points_pred_sample} ({moving_points_pred_sample/points_in_frame*100:.2f}%)')
+                    logger.info(f'  - Prediction differs from GT: {differs_in_sample} ({differs_in_sample/points_in_frame*100:.2f}%)')
+                    logger.info(f'  - Points saved after filtering: {np.sum(non_moving_mask)}')
+            
+            batch_time.update(time.time() - end)
+            end = time.time()
+            
+            if (i + 1) % args.print_freq == 0 and main_process():
+                logger.info('Test: [{}/{}] '
+                           'Data {data_time.val:.3f} ({data_time.avg:.3f}) '
+                           'Batch {batch_time.val:.3f} ({batch_time.avg:.3f})'.format(
+                                i + 1, len(val_loader),
+                                data_time=data_time,
+                                batch_time=batch_time))
+    
+    # 在结束时打印统计信息
+    if main_process():
+        logger.info(f'统计信息:')
+        logger.info(f'  - 总点数: {total_points_count}')
+        logger.info(f'  - 原始标签中的移动物体点数: {moving_points_in_gt_count} ({moving_points_in_gt_count/total_points_count*100:.2f}%)')
+        logger.info(f'  - 预测结果中的移动物体点数: {moving_points_in_pred_count} ({moving_points_in_pred_count/total_points_count*100:.2f}%)')
+        logger.info(f'  - 预测与标签不同的点数: {prediction_differs_count} ({prediction_differs_count/total_points_count*100:.2f}%)')
+        logger.info(f'  - 过滤后保存的点数: {total_points_count - moving_points_in_gt_count} ({(total_points_count - moving_points_in_gt_count)/total_points_count*100:.2f}%)')
+        
+        # 打印预测类别分布
+        logger.info(f'预测类别分布:')
+        for cls in sorted(prediction_class_counts.keys()):
+            count = prediction_class_counts[cls]
+            percentage = count / total_points_count * 100
+            logger.info(f'  - 类别 {cls}: {count} ({percentage:.2f}%)')
+            
+            # 特别标注移动物体类别 - 修改为类别ID为19的点
+            if cls == 19:
+                logger.info(f'    (移动物体类别)')
+        
+        # 打印真实标签类别分布
+        logger.info(f'真实标签类别分布:')
+        for cls in sorted(gt_class_counts.keys()):
+            count = gt_class_counts[cls]
+            percentage = count / total_points_count * 100
+            logger.info(f'  - 类别 {cls}: {count} ({percentage:.2f}%)')
+            
+            # 特别标注移动物体类别 - 修改为类别ID为19的点
+            if cls == 19:
+                logger.info(f'    (移动物体类别)')
+        
+        logger.info(f'Predictions saved to {args.save_folder}/predictions/')
+        logger.info('<<<<<<<<<<<<<<<<< End Evaluation and Saving Predictions <<<<<<<<<<<<<<<<<')
+
+
+def validate_and_print_points8(val_loader, model):
+    if main_process():
+        logger.info('>>>>>>>>>>>>>>>> Start Evaluation and Saving Predictions >>>>>>>>>>>>>>>>')
+    
+    batch_time = AverageMeter()
+    data_time = AverageMeter()
+    
+    # 点云统计计数器
+    total_points_count = 0
+    moving_points_in_gt_count = 0
+    moving_points_in_pred_count = 0
+    prediction_differs_count = 0
+    
+    # 添加预测类别统计字典
+    prediction_class_counts = {}
+    gt_class_counts = {}
+    
+    model.eval()
+    end = time.time()
+    
+    rank = 0
+    if args.multiprocessing_distributed:
+        rank = dist.get_rank()
+    
+    with torch.no_grad():
+        for i, batch_data in enumerate(val_loader):
+            data_time.update(time.time() - end)
+            
+            if main_process() and (i + 1) % args.print_freq == 0:
+                logger.info(f'Processing batch {i+1}/{len(val_loader)}')
+            
+            (coord, xyz, feat, target, offset, inds_reverse, file_names) = batch_data
+            
+            batch_points_count = coord.shape[0]
+            total_points_count += batch_points_count
+            
+            # 计算原始标签中移动物体的点数 - 类别ID改为 1-8
+            moving_mask_gt = (target[..., None] == torch.tensor([1, 2, 3, 4, 5, 6, 7, 8], device=target.device)).any(-1)
+            moving_points_gt = moving_mask_gt.sum().item()
+            moving_points_in_gt_count += moving_points_gt
+            
+            inds_reverse = inds_reverse.cuda(non_blocking=True)
+            
+            offset_ = offset.clone()
+            offset_[1:] = offset_[1:] - offset_[:-1]
+            
+            points_per_sample = offset_.tolist()
+            if main_process() and (i + 1) % args.print_freq == 0:
+                logger.info(f'Points per sample: {points_per_sample}')
+            
+            batch = torch.cat([torch.tensor([ii]*o) for ii, o in enumerate(offset_)], 0).long()
+            
+            coord = torch.cat([batch.unsqueeze(-1), coord], -1)
+            spatial_shape = np.clip((coord.max(0)[0][1:] + 1).numpy(), 128, None)
+                       
+            coord, xyz, feat, target = coord.cuda(non_blocking=True), xyz.cuda(non_blocking=True), feat.cuda(non_blocking=True), target.cuda(non_blocking=True)
+            offset = offset.cuda(non_blocking=True)
+            batch = batch.cuda(non_blocking=True)
+            
+            sinput = spconv.SparseConvTensor(feat, coord.int(), spatial_shape, args.batch_size_val)
+            
+            output = model(sinput, xyz, batch)
+            output = output[inds_reverse, :]
+            
+            pred_logits = output.max(1)[1]
+            
+            # 计算预测结果中移动物体的点数 - 类别ID改为 1-8
+            moving_mask_pred = (pred_logits[..., None] == torch.tensor([1, 2, 3, 4, 5, 6, 7, 8], device=pred_logits.device)).any(-1)
+            moving_points_pred = moving_mask_pred.sum().item()
+            moving_points_in_pred_count += moving_points_pred
+            
+            differs_mask = (pred_logits != target)
+            batch_prediction_differs = differs_mask.sum().item()
+            prediction_differs_count += batch_prediction_differs
+            
+            predictions = pred_logits.cpu().numpy()
+            target_cpu = target.cpu().numpy()
+            batch_idx = batch[inds_reverse].cpu().numpy()
+            
+            unique_pred_classes, pred_counts = np.unique(predictions, return_counts=True)
+            for cls, count in zip(unique_pred_classes, pred_counts):
+                prediction_class_counts[cls] = prediction_class_counts.get(cls, 0) + count
+            
+            unique_gt_classes, gt_counts = np.unique(target_cpu, return_counts=True)
+            for cls, count in zip(unique_gt_classes, gt_counts):
+                gt_class_counts[cls] = gt_class_counts.get(cls, 0) + count
+            
+            batch_time.update(time.time() - end)
+            end = time.time()
+            
+    if main_process():
+        logger.info(f'统计信息:')
+        logger.info(f'  - 总点数: {total_points_count}')
+        logger.info(f'  - 原始标签中的移动物体点数: {moving_points_in_gt_count} ({moving_points_in_gt_count/total_points_count*100:.2f}%)')
+        logger.info(f'  - 预测结果中的移动物体点数: {moving_points_in_pred_count} ({moving_points_in_pred_count/total_points_count*100:.2f}%)')
+        logger.info(f'  - 预测与标签不同的点数: {prediction_differs_count} ({prediction_differs_count/total_points_count*100:.2f}%)')
+        
+        logger.info(f'预测类别分布:')
+        for cls in sorted(prediction_class_counts.keys()):
+            count = prediction_class_counts[cls]
+            percentage = count / total_points_count * 100
+            logger.info(f'  - 类别 {cls}: {count} ({percentage:.2f}%)')
+            if cls in range(1, 9):
+                logger.info(f'    (移动物体类别)')
+        
+        logger.info(f'真实标签类别分布:')
+        for cls in sorted(gt_class_counts.keys()):
+            count = gt_class_counts[cls]
+            percentage = count / total_points_count * 100
+            logger.info(f'  - 类别 {cls}: {count} ({percentage:.2f}%)')
+            if cls in range(1, 9):
+                logger.info(f'    (移动物体类别)')
+        
+        logger.info('<<<<<<<<<<<<<<<<< End Evaluation and Saving Predictions <<<<<<<<<<<<<<<<<')
+
+
+def validate_and_print_points9(val_loader, model):
+    if main_process():
+        logger.info('>>>>>>>>>>>>>>>> Start Evaluation and Saving Predictions >>>>>>>>>>>>>>>>')
+    
+    batch_time = AverageMeter()
+    data_time = AverageMeter()
+    
+    # 点云统计计数器
+    total_points_count = 0
+    moving_points_in_gt_count = 0
+    moving_points_in_pred_count = 0
+    prediction_differs_count = 0
+    
+    # 添加预测类别统计字典
+    prediction_class_counts = {}
+    gt_class_counts = {}
+    
+    model.eval()
+    end = time.time()
+    
+    # 获取进程信息
+    rank = 0
+    if args.multiprocessing_distributed:
+        rank = dist.get_rank()
+    
+    with torch.no_grad():
+        for i, batch_data in enumerate(val_loader):
+            data_time.update(time.time() - end)
+            
+            if main_process() and (i + 1) % args.print_freq == 0:
+                logger.info(f'Processing batch {i+1}/{len(val_loader)}')
+            
+            # 解包批次数据
+            (coord, xyz, feat, target, offset, inds_reverse, file_names) = batch_data
+            
+            # 计算当前批次中的点数
+            batch_points_count = coord.shape[0]
+            total_points_count += batch_points_count
+            
+            # 计算原始标签中移动物体的点数 - 现在是 1-8
+            moving_mask_gt = (target[..., None] == torch.tensor([1, 2, 3, 4, 5, 6, 7, 8], device=target.device)).any(-1)
+            moving_points_gt = moving_mask_gt.sum().item()
+            moving_points_in_gt_count += moving_points_gt
+            
+            inds_reverse = inds_reverse.cuda(non_blocking=True)
+            
+            offset_ = offset.clone()
+            offset_[1:] = offset_[1:] - offset_[:-1]
+            
+            # 计算每个样本中的点数量
+            points_per_sample = offset_.tolist()
+            if main_process() and (i + 1) % args.print_freq == 0:
+                logger.info(f'Points per sample: {points_per_sample}')
+            
+            batch = torch.cat([torch.tensor([ii]*o) for ii,o in enumerate(offset_)], 0).long()
+            
+            coord = torch.cat([batch.unsqueeze(-1), coord], -1)
+            spatial_shape = np.clip((coord.max(0)[0][1:] + 1).numpy(), 128, None)
+                        
+            coord, xyz, feat, target = coord.cuda(non_blocking=True), xyz.cuda(non_blocking=True), feat.cuda(non_blocking=True), target.cuda(non_blocking=True)
+            offset = offset.cuda(non_blocking=True)
+            batch = batch.cuda(non_blocking=True)
+            
+            sinput = spconv.SparseConvTensor(feat, coord.int(), spatial_shape, args.batch_size_val)
+            
+            # 运行模型并获取预测结果
+            output = model(sinput, xyz, batch)
+            output = output[inds_reverse, :]
+            
+            # 获取预测类别
+            pred_logits = output.max(1)[1]
+            
+                        # 计算预测结果中移动物体的点数 - 修改为类别ID为19的点
+            moving_mask_pred = (pred_logits[..., None] == torch.tensor([1, 2, 3, 4, 5, 6, 7, 8], device=pred_logits.device)).any(-1)
+            moving_points_pred = moving_mask_pred.sum().item()
+            moving_points_in_pred_count += moving_points_pred
+            
+                        # 计算预测与标签不同的点数
+            differs_mask = (pred_logits != target)
+            batch_prediction_differs = differs_mask.sum().item()
+            prediction_differs_count += batch_prediction_differs
+            
+                        # 将预测结果和目标标签转移到CPU进行保存
+            predictions = pred_logits.cpu().numpy()
+            target_cpu = target.cpu().numpy()
+            batch_idx = batch[inds_reverse].cpu().numpy()
+            
+
+                        # 统计预测类别分布
+            unique_pred_classes, pred_counts = np.unique(predictions, return_counts=True)
+            for cls, count in zip(unique_pred_classes, pred_counts):
+                prediction_class_counts[cls] = prediction_class_counts.get(cls, 0) + count
+            
+
+                        # 统计真实标签类别分布
+            unique_gt_classes, gt_counts = np.unique(target_cpu, return_counts=True)
+            for cls, count in zip(unique_gt_classes, gt_counts):
+                gt_class_counts[cls] = gt_class_counts.get(cls, 0) + count
+            
+                        # 保存预测结果，按照SemanticKITTI格式
+            for b_idx in np.unique(batch_idx):
+                mask = batch_idx == b_idx
+                scan_predictions = predictions[mask]
+                scan_targets = target_cpu[mask]
+                
+                                # 使用原始标签中的移动物体掩码过滤预测结果 - 修改为类别ID为19的点
+                moving_mask_gt_sample = np.isin(scan_targets, [1, 2, 3, 4, 5, 6, 7, 8])
+                non_moving_mask = ~moving_mask_gt_sample
+                filtered_predictions = scan_predictions[non_moving_mask]
+
+                # 使用文件名构建保存路径
+                current_file = file_names[int(b_idx)]
+                sequence_dir = os.path.dirname(os.path.dirname(current_file))
+                sequence_id = os.path.basename(sequence_dir)
+                frame_id = os.path.basename(current_file).split('.')[0]
+                
+                # 创建保存目录
+                # save_dir = os.path.join(args.save_folder, 'predictions', sequence_id)
+                # os.makedirs(save_dir, exist_ok=True)
+                
+                # 保存过滤后的预测结果
+                # save_path = os.path.join(save_dir, f'{frame_id}.label')
+                # filtered_predictions = filtered_predictions.astype(np.uint32)
+                # filtered_predictions.tofile(save_path)
+
+
+                if main_process() and (i + 1) % args.print_freq == 0:
+                    points_in_frame = np.sum(mask)
+                    moving_points_gt_sample = np.sum(moving_mask_gt_sample)
+                    moving_points_pred_sample = np.sum(np.isin(scan_predictions, [1, 2, 3, 4, 5, 6, 7, 8]))
+                    differs_in_sample = np.sum(scan_predictions != scan_targets)
+                    
+                    logger.info(f'Saved prediction for frame {b_idx}')
+                    logger.info(f'  - Total points: {points_in_frame}')
+                    logger.info(f'  - Moving points in GT: {moving_points_gt_sample}')
+                    logger.info(f'  - Moving points in pred: {moving_points_pred_sample}')
+                    logger.info(f'  - Prediction differs: {differs_in_sample}')
+                    logger.info(f'  - Points saved: {np.sum(non_moving_mask)}')
+            
+            batch_time.update(time.time() - end)
+            end = time.time()
+
+            if (i + 1) % args.print_freq == 0 and main_process():
+                logger.info('Test: [{}/{}] '
+                           'Data {data_time.val:.3f} ({data_time.avg:.3f}) '
+                           'Batch {batch_time.val:.3f} ({batch_time.avg:.3f})'.format(
+                                i + 1, len(val_loader),
+                                data_time=data_time,
+                                batch_time=batch_time))    
+                
+    # 在结束时打印统计信息
+    if main_process():
+        logger.info(f'统计信息:')
+        logger.info(f'  - 总点数: {total_points_count}')
+        logger.info(f'  - 原始标签中的移动物体点数: {moving_points_in_gt_count} ({moving_points_in_gt_count/total_points_count*100:.2f}%)')
+        logger.info(f'  - 预测结果中的移动物体点数: {moving_points_in_pred_count} ({moving_points_in_pred_count/total_points_count*100:.2f}%)')
+        logger.info(f'  - 预测与标签不同的点数: {prediction_differs_count} ({prediction_differs_count/total_points_count*100:.2f}%)')
+        logger.info(f'  - 过滤后保存的点数: {total_points_count - moving_points_in_gt_count} ({(total_points_count - moving_points_in_gt_count)/total_points_count*100:.2f}%)')
+        
+        # 打印预测类别分布
+        logger.info(f'预测类别分布:')
+        for cls in sorted(prediction_class_counts.keys()):
+            count = prediction_class_counts[cls]
+            percentage = count / total_points_count * 100
+            logger.info(f'  - 类别 {cls}: {count} ({percentage:.2f}%)')
+            
+            # 特别标注移动物体类别 - 修改为类别ID为19的点
+            if cls == 19:
+                logger.info(f'    (移动物体类别)')
+        
+        # 打印真实标签类别分布
+        logger.info(f'真实标签类别分布:')
+        for cls in sorted(gt_class_counts.keys()):
+            count = gt_class_counts[cls]
+            percentage = count / total_points_count * 100
+            logger.info(f'  - 类别 {cls}: {count} ({percentage:.2f}%)')
+            
+            # 特别标注移动物体类别 - 修改为类别ID为19的点
+            if cls == 19:
+                logger.info(f'    (移动物体类别)')
+        
+        logger.info(f'Predictions saved to {args.save_folder}/predictions/')
+        logger.info('<<<<<<<<<<<<<<<<< End Evaluation and Saving Predictions <<<<<<<<<<<<<<<<<')
+
+
+def remove_moving_points_from_pointcloud(val_loader, model, save_folder='output'):
+    """
+    处理SemanticKITTI点云数据，移除移动点并保存
+    
+    参数:
+    - val_loader: 验证数据加载器
+    - model: 用于预测的神经网络模型
+    - logger: 日志记录器（可选）
+    - save_folder: 保存结果的文件夹路径（可选）
+    
+    功能:
+    1. 对每帧点云数据预测标签
+    2. 移除被预测为移动点的点
+    3. 按原始格式保存处理后的点云数据
+    """
+    if main_process():
+        logger.info('>>>>>>>>>>>>>>>> Start Removing Moving Points >>>>>>>>>>>>>>>>')
+    
+    batch_time = time.time()
+    
+    # 统计计数器
+    total_points_count = 0
+    removed_points_count = 0
+    
+    model.eval()
+    
+    with torch.no_grad():
+        for i, batch_data in enumerate(val_loader):
+            if main_process():
+                logger.info(f'Processing batch {i+1}/{len(val_loader)}')
+            
+            # 解包批次数据
+            (coord, xyz, feat, target, offset, inds_reverse, file_names) = batch_data
+            
+            # 将数据移动到GPU
+            coord = coord.cuda()
+            xyz = xyz.cuda()
+            feat = feat.cuda()
+            target = target.cuda()
+            offset = offset.cuda()
+            inds_reverse = inds_reverse.cuda()
+            
+            # 构建批次索引
+            offset_ = offset.clone()
+            offset_[1:] = offset_[1:] - offset_[:-1]
+            
+            batch = torch.cat([torch.tensor([ii]*o) for ii,o in enumerate(offset_)], 0).long().cuda()
+            
+            # 添加批次维度到坐标
+            coord = torch.cat([batch.unsqueeze(-1), coord], -1)
+            spatial_shape = np.clip((coord.cpu().max(0)[0][1:] + 1).numpy(), 128, None)
+            
+            # 创建稀疏卷积张量并运行模型
+            sinput = spconv.SparseConvTensor(feat, coord.int(), spatial_shape, val_loader.batch_size)
+            
+            try:
+                # 运行模型并获取预测结果
+                output = model(sinput, xyz, batch)
+                
+                # 检查inds_reverse是否有效
+                if torch.max(inds_reverse) >= output.shape[0]:
+                    logger.warning(f"inds_reverse中的索引超出范围，将进行修复")
+                    inds_reverse = torch.clamp(inds_reverse, 0, output.shape[0] - 1)
+                
+                # 应用inds_reverse重新排序输出
+                output = output[inds_reverse, :]
+                
+                # 获取预测类别
+                pred_logits = output.max(1)[1]
+                
+                # 将数据转移到CPU
+                predictions = pred_logits.cpu().numpy()
+                batch_idx = batch[inds_reverse].cpu().numpy()
+                
+                # 处理并保存每个样本
+                for b_idx in np.unique(batch_idx):
+                    # 找到当前批次样本的掩码
+                    mask = batch_idx == b_idx
+                    scan_predictions = predictions[mask]
+                    
+                    # 从原始数据中选择非移动点
+                    #? DEBUG
+                    moving_classes = [1, 2, 3, 4, 5, 6, 7, 8]
+                    non_moving_mask = np.logical_not(np.isin(scan_predictions, moving_classes))
+                    
+                    # 使用文件名构建保存路径
+                    current_file = file_names[int(b_idx)]
+                    sequence_dir = os.path.dirname(os.path.dirname(current_file))
+                    sequence_id = os.path.basename(sequence_dir)
+                    frame_id = os.path.basename(current_file).split('.')[0]
+                    
+                    # 创建保存目录
+                    save_dir_labels = os.path.join(save_folder, 'labels_without_moving_points', sequence_id)
+                    save_dir_points = os.path.join(save_folder, 'points_without_moving_points', sequence_id)
+                    os.makedirs(save_dir_labels, exist_ok=True)
+                    os.makedirs(save_dir_points, exist_ok=True)
+                    
+                    # 原始文件对应的数据
+                    original_data = np.fromfile(current_file, dtype=np.float32).reshape(-1, 4)
+                    original_labels = np.fromfile(current_file.replace('velodyne', 'labels').replace('.bin', '.label'), dtype=np.uint32)
+                    
+                    # 使用非移动点掩码过滤点云和标签
+                    filtered_points = original_data[non_moving_mask]
+                    filtered_labels = original_labels[non_moving_mask]
+                    
+                    # 统计移除的点数
+                    total_points_count += len(original_data)
+                    removed_points_count += len(original_data) - len(filtered_points)
+                    
+                    # 保存处理后的点云和标签
+                    label_save_path = os.path.join(save_dir_labels, f'{frame_id}.label')
+                    points_save_path = os.path.join(save_dir_points, f'{frame_id}.bin')
+                    
+                    filtered_labels.astype(np.uint32).tofile(label_save_path)
+                    filtered_points.astype(np.float32).tofile(points_save_path)
+                    
+                    # 打印处理详情
+                    if main_process():
+                        logger.info(f'Processed sequence {sequence_id}, frame {frame_id}')
+                        logger.info(f'  - Original points: {len(original_data)}')
+                        logger.info(f'  - Points after removing moving points: {len(filtered_points)}')
+                        logger.info(f'  - Removed points: {len(original_data) - len(filtered_points)}')
+            
+            except Exception as e:
+                if main_process():
+                    logger.error(f"处理批次 {i+1} 时发生错误: {str(e)}")
+                    logger.error(traceback.format_exc())
+                continue
+    
+    # 最终统计信息
+    if main_process():
+        logger.info('点云处理统计:')
+        logger.info(f'  - 总点数: {total_points_count}')
+        logger.info(f'  - 移除的点数: {removed_points_count} ({removed_points_count/total_points_count*100:.2f}%)')
+        logger.info(f'  - 保存路径: {save_folder}/points_without_moving_points 和 {save_folder}/labels_without_moving_points')
+        logger.info('<<<<<<<<<<<<<<<<< End Removing Moving Points <<<<<<<<<<<<<<<<<')
+    
+    return {
+        "total_points": total_points_count,
+        "removed_points": removed_points_count,
+        "removal_percentage": removed_points_count / total_points_count * 100
+    }
 
 if __name__ == '__main__':
     import gc

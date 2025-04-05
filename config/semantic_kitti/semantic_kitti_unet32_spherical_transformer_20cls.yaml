@@ -2,7 +2,7 @@ DATA:
   data_name: semantic_kitti
   data_root: /data/ljc/SemanticKITTI/dataset ## Fill in the data path 
   label_mapping: util/semantic-kitti.yaml
-  classes: 19
+  classes: 20
   fea_dim: 6
   voxel_size: [0.05, 0.05, 0.05]
   voxel_max: 120000 
@@ -27,7 +27,7 @@ TRAIN:
   max_batch_points: 1000000
   class_weight: [ 3.1557,  8.7029,  7.8281,  6.1354,  6.3161,  7.9937,  8.9704,
                           10.1922,  1.6155,  4.2187,  1.9385,  5.5455,  2.0198,  2.6261,  1.3212,
-                          5.1102,  2.5492,  5.8585,  7.3929]
+                          5.1102,  2.5492,  5.8585,  7.3929, 7.3929]
   xyz_norm: False
   pc_range: [[-51.2, -51.2, -4], [51.2, 51.2, 2.4]]
   window_size_sphere: [2, 2, 80]
@@ -64,7 +64,7 @@ TRAIN:
   save_freq: 1
   save_path: runs/semantic_kitti_unet32_spherical_transformer
   weight:  # path to initial weight (default: none)
-  resume:  /home/ljc/SphereFormer/runs/semantic_kitti_unet32_spherical_transformer/model/model_semantic_kitti.pth # path to latest checkpoint (default: none)
+  resume:  /home/ljc/SphereFormer/runs/semantic_kitti_unet32_spherical_transformer/model/model_best.pth # path to latest checkpoint (default: none)
   evaluate: True  # evaluate on validation set, extra gpu memory needed and small batch_size_val is recommend
   eval_freq: 1
   val: True

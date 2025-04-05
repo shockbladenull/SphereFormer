@@ -174,6 +174,6 @@ class SemanticKITTI(torch.utils.data.Dataset):
         else:
             coords, xyz, feats, labels, inds_reconstruct = data_prepare(xyz, feats, labels_in, self.split, self.voxel_size, self.voxel_max, None, self.xyz_norm)
             if self.split == 'val':
-                return coords, xyz, feats, labels, inds_reconstruct
+                return coords, xyz, feats, labels, inds_reconstruct, self.files[index]
             elif self.split == 'test':
                 return coords, xyz, feats, labels, inds_reconstruct, self.files[index]
