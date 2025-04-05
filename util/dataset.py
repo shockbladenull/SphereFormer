@@ -27,13 +27,12 @@ def elastic(x, gran, mag):
     return x + g(x) * mag
 
 
-class SemanticKITTI(torch.utils.data.Dataset):
+class RobotCar(torch.utils.data.Dataset):
     def __init__(self, 
         data_path, 
         voxel_size=[0.1, 0.1, 0.1], 
-        split='train', 
-        return_ref=True, 
-        label_mapping="util/semantic-kitti.yaml", 
+        split='test',
+        return_ref=True,
         rotate_aug=True, 
         flip_aug=True, 
         scale_aug=True, 
@@ -51,9 +50,6 @@ class SemanticKITTI(torch.utils.data.Dataset):
     ):
         super().__init__()
         self.num_classes = 19
-        with open(label_mapping, 'r') as stream:
-            semkittiyaml = yaml.safe_load(stream)
-        self.learning_map = semkittiyaml['learning_map']
         self.return_ref = return_ref
         self.split = split
         self.rotate_aug = rotate_aug
@@ -72,20 +68,16 @@ class SemanticKITTI(torch.utils.data.Dataset):
         self.use_tta = use_tta
         self.vote_num = vote_num
 
-        if split == 'train':
-            splits = semkittiyaml['split']['train']
-        elif split == 'val':
-            splits = semkittiyaml['split']['valid']
-        elif split == 'test':
-            splits = semkittiyaml['split']['test']
-        elif split == 'trainval':
-            splits = semkittiyaml['split']['train'] + semkittiyaml['split']['valid']
-        else:
-            raise Exception('Split must be train/val/test')
+        # Oxford
+        file_list = ['2019-01-11-14-02-26-radar-oxford-10k', '2019-01-14-12-05-52-radar-oxford-10k',\
+                     '2019-01-14-14-48-55-radar-oxford-10k', '2019-01-18-15-20-12-radar-oxford-10k',]
+
+        # NCLT
+        # file_list = ['2012-01-22', '2012-02-02', '2012-02-18', '2012-05-11',]
 
         self.files = []
-        for i_folder in splits:
-            self.files += sorted(glob.glob(os.path.join(data_path, "sequences", str(i_folder).zfill(2), 'velodyne', "*.bin")))
+        for file in file_list:
+            self.files += sorted(glob.glob(os.path.join(data_path, file, 'velodyne_left', "*.bin")))
 
         if isinstance(voxel_size, list):
             voxel_size = np.array(voxel_size).astype(np.float32)
@@ -109,15 +101,18 @@ class SemanticKITTI(torch.utils.data.Dataset):
 
         file_path = self.files[index]
 
-        raw_data = np.fromfile(file_path, dtype=np.float32).reshape((-1, 4))
-        annotated_data = np.fromfile(file_path.replace('velodyne', 'labels')[:-3] + 'label',
-                                        dtype=np.uint32).reshape((-1, 1))
-        annotated_data = annotated_data & 0xFFFF  # delete high 16 digits binary
-        annotated_data = np.vectorize(self.learning_map.__getitem__)(annotated_data)
+        raw_data = np.fromfile(file_path, dtype=np.float32).reshape(-1, 4)
+        # raw_data = np.fromfile(file_path, dtype=np.float32).reshape(4, -1).transpose()
+        raw_data[:, 2] = -1 * raw_data[:, 2]
+        raw_data[:, 3] = 0
 
         points = raw_data[:, :4]
 
         if self.split != 'test':
+            annotated_data = np.fromfile(file_path.replace('velodyne', 'labels')[:-3] + 'label',
+                                         dtype=np.uint32).reshape((-1, 1))
+            annotated_data = annotated_data & 0xFFFF  # delete high 16 digits binary
+            annotated_data = np.vectorize(self.learning_map.__getitem__)(annotated_data)
             annotated_data[annotated_data == 0] = self.ignore_label + 1
             annotated_data = annotated_data - 1
             labels_in = annotated_data.astype(np.uint8).reshape(-1)
@@ -176,4 +171,4 @@ class SemanticKITTI(torch.utils.data.Dataset):
             if self.split == 'val':
                 return coords, xyz, feats, labels, inds_reconstruct, self.files[index]
             elif self.split == 'test':
-                return coords, xyz, feats, labels, inds_reconstruct, self.files[index]
+                return coords, xyz, feats , labels, inds_reconstruct, self.files[index]
